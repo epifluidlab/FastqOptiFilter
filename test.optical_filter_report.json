@@ -1,0 +1,42 @@
+{
+  "candidate_optical_components": 2579,
+  "candidate_optical_fraction_of_exact_sequence_duplicate_excess": 0.4637732506643047,
+  "candidate_optical_fraction_removed": 0.028792327911401454,
+  "candidate_optical_pairs_removed": 2618,
+  "classification_scope": "high-confidence FASTQ-level candidates",
+  "coordinate_distance_threshold": 2500,
+  "exact_sequence_duplicate_excess_pairs": 5645,
+  "exact_sequence_duplicate_families": 5443,
+  "headers_without_parsed_coordinates": 0,
+  "input_r1": "cfWGS_GBM_33samples_28_S28_L001_R1_001.fastq.gz",
+  "input_r2": "cfWGS_GBM_33samples_28_S28_L001_R2_001.fastq.gz",
+  "method": "exact paired-sequence plus spatial proximity",
+  "notes": [
+    "R1 and R2 remained synchronized; a pair was removed from both files.",
+    "Non-spatial exact-sequence duplicates were retained.",
+    "Connected spatial components were used, so a component member may be more than the threshold from the selected representative while remaining linked through another member.",
+    "Sequence-divergent copies caused by sequencing errors are not detected.",
+    "Re-align the filtered FASTQs and run duplicate metrics for the adjusted library-complexity analysis; preserve the original FASTQs."
+  ],
+  "optical_component_size_histogram": {
+    "2": 2544,
+    "3": 31,
+    "4": 4
+  },
+  "output_r1": "cfWGS_GBM_33samples_28_S28_L001.optical_filtered.R1.fastq.gz",
+  "output_r2": "cfWGS_GBM_33samples_28_S28_L001.optical_filtered.R2.fastq.gz",
+  "paired_sequence_signature": "SHA-256 over complete R1 and R2 sequences",
+  "pairs_in_exact_sequence_duplicate_families": 11088,
+  "parallel_cpu_workers": 4,
+  "parallel_gzip_program": null,
+  "pigz_threads_per_output": null,
+  "raw_exact_sequence_duplicate_fraction": 0.06208276969437021,
+  "remaining_exact_sequence_duplicate_excess_pairs": 3027,
+  "remaining_exact_sequence_duplicate_fraction_among_retained": 0.03427736697278873,
+  "representative_selection": "highest summed Phred quality; earliest on tie",
+  "retained_fraction": 0.9712076720885986,
+  "retained_pairs": 88309,
+  "script_version": "1.0.0",
+  "spatial_metric": "max(abs(delta_x), abs(delta_y))",
+  "total_input_pairs": 90927
+}
