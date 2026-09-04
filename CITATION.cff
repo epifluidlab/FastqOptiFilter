@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "If you use FastqOptiFilter in your research, please cite it using these metadata."
+title: "FastqOptiFilter: quality-aware, FDR-controlled optical and proximity duplicate filtering for paired-end Illumina FASTQ files"
+abstract: >-
+  FastqOptiFilter removes optical and proximity duplicates from synchronized
+  paired-end Illumina FASTQ files before alignment, using the lane/tile/X/Y
+  coordinates already present in the read names. It applies no fixed
+  spatial-distance cutoff: the length scale of duplication is estimated from
+  each run, so the same command works on a patterned flowcell where duplicates
+  spread over thousands of pixels and on a non-patterned flowcell where they
+  sit within tens of pixels. Every run reports whether its own statistical null
+  is calibrated, using two negative controls built from the data. The purpose
+  is library complexity estimation, which optical duplicates corrupt because
+  complexity estimators read the duplicate rate as evidence of resampling a
+  finite pool of molecules.
+type: software
+authors:
+  - given-names: "Yaping"
+    family-names: "Liu"
+    email: "lyping1986@gmail.com"
+    # Add your ORCID here if you have one, e.g.
+    # orcid: "https://orcid.org/0000-0000-0000-0000"
+repository-code: "https://github.com/epifluidlab/FastqOptiFilter"
+url: "https://github.com/epifluidlab/FastqOptiFilter"
+doi: "10.5281/zenodo.22307671"
+license: MIT
+version: "2.0.0"
+date-released: "2026-09-04"
+keywords:
+  - bioinformatics
+  - sequencing
+  - Illumina
+  - FASTQ
+  - optical duplicates
+  - PCR duplicates
+  - library complexity
+  - cell-free DNA
+  - flowcell
+  - false discovery rate

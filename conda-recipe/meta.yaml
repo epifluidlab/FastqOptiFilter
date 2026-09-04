@@ -1,0 +1,80 @@
+{# conda-build cannot read a file outside the recipe directory, so the version #}
+{# is pinned here. The test section asserts it against fastq_optifilter.VERSION, #}
+{# so a mismatch fails the build instead of shipping a mislabelled package. #}
+{% set version = "2.0.0" %}
+
+package:
+  name: fastqoptifilter
+  version: {{ version }}
+
+source:
+  # Builds from a clone, so `conda build conda-recipe` works without a release.
+  path: ..
+
+  # For a Bioconda submission, replace the two lines above with the release
+  # tarball and its checksum:
+  #
+  #   url: https://github.com/epifluidlab/FastqOptiFilter/archive/refs/tags/v{{ version }}.tar.gz
+  #   sha256: <sha256sum of that tarball>
+
+build:
+  number: 0
+  noarch: python
+  script: {{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
+  entry_points:
+    - fastqoptifilter = fastq_optifilter:main
+
+requirements:
+  host:
+    - python >=3.10
+    - pip
+    - setuptools >=64
+    - wheel
+  run:
+    - python >=3.10
+    - numpy >=1.26
+    # Hard floor: scipy.stats.poisson_binom does not exist before 1.17, and an
+    # older scipy fails at import rather than reporting a version problem.
+    - scipy >=1.17
+    # matplotlib-base avoids pulling a GUI toolkit; the tool renders to PNG
+    # through the Agg backend and never opens a window.
+    - matplotlib-base >=3.7
+
+test:
+  imports:
+    - fastq_optifilter
+  commands:
+    - fastqoptifilter --help
+    - python -c "from fastq_optifilter import VERSION; assert VERSION == '{{ version }}'"
+
+about:
+  home: https://github.com/epifluidlab/FastqOptiFilter
+  license: MIT
+  license_family: MIT
+  license_file: LICENSE
+  summary: Quality-aware, FDR-controlled optical and proximity duplicate filtering for paired-end Illumina FASTQ files
+  description: |
+    FastqOptiFilter removes optical and proximity duplicates from synchronized
+    paired-end Illumina FASTQ files before alignment, using the lane/tile/X/Y
+    coordinates already present in the read names.
+
+    It applies no fixed spatial-distance cutoff. The length scale of duplication
+    is estimated from each run, so the same command works on a patterned
+    flowcell where duplicates spread over thousands of pixels and on a
+    non-patterned flowcell where they sit within tens of pixels. Every run also
+    reports whether its own statistical null is calibrated, using two negative
+    controls built from the data.
+
+    The purpose is library complexity. Complexity and library-size estimators
+    read the duplicate rate as evidence of resampling a finite pool of
+    molecules; optical duplicates are not resampling, and leaving them in
+    understates library size, by 37-fold on the patterned run benchmarked in the
+    documentation.
+  doc_url: https://github.com/epifluidlab/FastqOptiFilter#readme
+  dev_url: https://github.com/epifluidlab/FastqOptiFilter
+
+extra:
+  identifiers:
+    - doi:10.5281/zenodo.22307671
+  recipe-maintainers:
+    - epifluidlab

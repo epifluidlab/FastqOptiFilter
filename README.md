@@ -1,5 +1,9 @@
 # FastqOptiFilter
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22307671.svg)](https://doi.org/10.5281/zenodo.22307671)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-%E2%89%A5%203.10-blue.svg)](https://www.python.org/)
+
 Quality-aware, FDR-controlled removal of optical and proximity duplicates from
 synchronized paired-end Illumina FASTQ files — **before alignment**, using the
 lane/tile/X/Y coordinates already present in the read names.
@@ -37,6 +41,8 @@ two negative controls built from the data.
 - [How the model works](#how-the-model-works)
 - [Scope and limitations](#scope-and-limitations)
 - [Tests](#tests)
+- [Citation](#citation)
+- [Authors](#authors)
 - [Contact](#contact)
 - [License](#license)
 
@@ -172,68 +178,97 @@ be parsed abort the run unless `--unparsed keep` is given.
 
 ## Installation
 
-### 1. Clone
+Everything below installs the same tool. Pick one.
+
+> **Python must be 3.10 or newer**, and **SciPy 1.17 or newer**. Many systems
+> still default to Python 3.9. FastqOptiFilter uses `scipy.stats.poisson_binom`,
+> which does not exist before SciPy 1.17, and an older SciPy fails at import
+> with a confusing `ImportError` rather than a version message.
+
+### Option A — pip (recommended)
 
 ```bash
-git clone https://github.com/epifluidlab/FastqOptiFilter.git
-cd FastqOptiFilter
+pip install fastqoptifilter
 ```
 
-### 2. Create an environment
-
-Pick whichever you use. **Check your Python version first** — many systems
-still default to 3.9, which cannot run this tool.
-
-<details open>
-<summary><b>venv</b> (recommended)</summary>
+This installs the `fastqoptifilter` command and pulls NumPy, SciPy and
+Matplotlib automatically. Into an isolated environment:
 
 ```bash
-python3 --version          # must be 3.10 or newer
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
-pip install -r fastq_optifilter_requirements.txt
+pip install fastqoptifilter
 ```
 
-</details>
-
-<details>
-<summary><b>conda / mamba</b></summary>
-
-```bash
-conda create -n fastqoptifilter python=3.12
-conda activate fastqoptifilter
-pip install -r fastq_optifilter_requirements.txt
-```
-
-Install the packages with `pip` inside the conda environment, since
-`scipy>=1.17` may not yet be available on all conda channels.
-
-</details>
-
-<details>
-<summary><b>uv</b></summary>
+Or with [`uv`](https://docs.astral.sh/uv/):
 
 ```bash
 uv venv --python 3.12
 source .venv/bin/activate
-uv pip install -r fastq_optifilter_requirements.txt
+uv pip install fastqoptifilter
 ```
 
-</details>
-
-### 3. Verify
+Or with [`pipx`](https://pipx.pypa.io/), which keeps the tool in its own
+environment while putting the command on your `PATH`:
 
 ```bash
-python3 -c "from scipy.stats import poisson_binom; print('scipy OK')"
+pipx install fastqoptifilter
+```
+
+### Option B — conda / mamba
+
+```bash
+conda create -n fastqoptifilter -c conda-forge -c bioconda fastqoptifilter
+conda activate fastqoptifilter
+```
+
+`-c conda-forge` matters: SciPy 1.17+ comes from conda-forge, not from the
+`defaults` channel. If your conda is old enough that the solve is slow, `mamba`
+is a drop-in replacement.
+
+To build the conda package yourself from a clone, a recipe is included:
+
+```bash
+conda install -c conda-forge conda-build
+conda build conda-recipe
+conda install -c conda-forge --use-local fastqoptifilter
+```
+
+### Option C — from source
+
+No installation step; the tool is a single self-contained module.
+
+```bash
+git clone https://github.com/epifluidlab/FastqOptiFilter.git
+cd FastqOptiFilter
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r fastq_optifilter_requirements.txt
 python3 fastq_optifilter.py --help
 ```
 
-### 4. Run the test suite (optional, ~5 minutes)
+Or install the clone as an editable package, which also gives you the
+`fastqoptifilter` command:
 
-This simulates data with known ground truth and asserts that the null is
-calibrated, that nothing is removed from a pure-null dataset, and that the
-nearby-tile search is what recovers cross-tile duplicates.
+```bash
+pip install -e .
+```
+
+### Verify the installation
+
+```bash
+python3 -c "from scipy.stats import poisson_binom; print('scipy OK')"
+fastqoptifilter --help          # or: python3 fastq_optifilter.py --help
+```
+
+### Run the test suite (optional, ~5 minutes)
+
+Requires a clone, since the tests are not shipped in the package. This
+simulates data with known ground truth and asserts that the null is calibrated,
+that nothing is removed from a pure-null dataset, and that the nearby-tile
+search is what recovers cross-tile duplicates.
 
 ```bash
 python3 test/test_calibration.py
@@ -713,6 +748,53 @@ python3 test/evaluate_run.py --truth sim.truth.tsv.gz --filtered-r1 out_R1.fastq
 python3 test/spike_pcr_duplicates.py --r1 real_R1.fastq.gz --r2 real_R2.fastq.gz \
     --out-prefix spiked --pcr-rate 0.05
 ```
+
+---
+
+## Citation
+
+FastqOptiFilter is archived on Zenodo and has a DOI. If you use it, please
+cite it:
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22307671.svg)](https://doi.org/10.5281/zenodo.22307671)
+
+> Liu, Y. *FastqOptiFilter: quality-aware, FDR-controlled optical and proximity
+> duplicate filtering for paired-end Illumina FASTQ files.*
+> https://doi.org/10.5281/zenodo.22307671
+
+```bibtex
+@software{fastqoptifilter,
+  author  = {Liu, Yaping},
+  title   = {{FastqOptiFilter: quality-aware, FDR-controlled optical and
+             proximity duplicate filtering for paired-end Illumina FASTQ files}},
+  year    = {2026},
+  doi     = {10.5281/zenodo.22307671},
+  url     = {https://github.com/epifluidlab/FastqOptiFilter},
+  version = {2.0.0},
+  license = {MIT}
+}
+```
+
+The DOI above always resolves to the latest release. Zenodo also mints a
+version-specific DOI for each release; use that one if you need to pin an exact
+version for reproducibility. Machine-readable metadata lives in
+[CITATION.cff](CITATION.cff), which is what GitHub's "Cite this repository"
+button reads.
+
+---
+
+## Authors
+
+**Yaping Liu** — design, direction and scientific review.
+
+**Claude Code (Opus 5, Anthropic)** — co-author. Contributed to the design of
+the spatial statistical model, the implementation, and the benchmarking and
+calibration work described above, in collaboration with and under the review of
+the author. Contributions are recorded per commit as `Co-Authored-By` trailers
+in the git history.
+
+Responsibility for the correctness and the scientific claims of this software
+rests with the human author.
 
 ---
 
