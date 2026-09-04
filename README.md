@@ -738,8 +738,6 @@ model discards the extra collisions.
 
 ### 6. Performance
 
-| | |
-|:---|---:|
 Measured on an Apple M-series laptop (8 cores), 151 bp reads, a realistic
 duplicate load, 20 permutation replicates, **without `pigz`**:
 
