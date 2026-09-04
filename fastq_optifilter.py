@@ -601,26 +601,145 @@ def pair_key(left: int, right: int, read_count: int) -> int:
     return left * read_count + right
 
 
-def decode_pair_keys(keys: set[int], read_count: int) -> tuple[np.ndarray, np.ndarray]:
-    ordered = np.fromiter(sorted(keys), dtype=np.int64, count=len(keys))
-    return ordered // read_count, ordered % read_count
+def seed_entropy(seed: bytes) -> float:
+    """Shannon entropy of a seed in bits per base, from 0 to 2.
+
+    A seed only earns its place in the index if it identifies a particular
+    molecule. A run of one base identifies nothing: every read carrying that
+    homopolymer collides with every other, and a bucket of k of them still
+    costs k(k-1)/2 candidate pairs. Random sequence scores close to 2, a pure
+    homopolymer scores 0, and adapter or poly-G runs fall well below 1.
+    """
+    if not seed:
+        return 0.0
+    counts = Counter(seed)
+    total = len(seed)
+    return -sum(
+        (n / total) * math.log2(n / total) for n in counts.values() if n
+    )
 
 
-def add_all_pairs(
-    members: list[int],
-    candidates: set[int],
-    read_count: int,
-    max_candidates: int,
-) -> None:
-    for left_position in range(len(members) - 1):
-        left = members[left_position]
-        for right in members[left_position + 1 :]:
-            candidates.add(pair_key(left, right, read_count))
-        if len(candidates) > max_candidates:
-            raise MemoryError(
-                f"Candidate count exceeded --max-candidates={max_candidates:,}; "
-                "increase the limit or pre-filter adapter/low-complexity reads"
+class CandidateSet:
+    """Distinct candidate pair keys, held as sorted int64 rather than a set.
+
+    A Python set of fifty million integers costs close to three gigabytes,
+    because every element carries a boxed integer and a hash-table slot. The
+    same keys in an int64 array cost four hundred megabytes. On a large run the
+    candidate set, not the sequence or spatial model, is what exhausts memory,
+    so keys are appended to a buffer and folded into one sorted unique array
+    whenever the buffer fills.
+
+    Pairs within a bucket are also formed with array arithmetic instead of a
+    Python double loop, which matters because a bucket of ``k`` members yields
+    ``k(k-1)/2`` of them.
+    """
+
+    def __init__(self, read_count: int, limit: int, block: int = 32_000_000) -> None:
+        self.read_count = read_count
+        self.limit = limit
+        self.block = block
+        self._sorted = np.zeros(0, dtype=np.int64)
+        self._pending: list[np.ndarray] = []
+        self._pending_size = 0
+        self.largest_bucket = 0
+        self.largest_bucket_seed: bytes | None = None
+        self.largest_bucket_source = "seed"
+
+    def __len__(self) -> int:
+        """Distinct pairs. Compacts first, so avoid it in inner loops."""
+        self._compact()
+        return int(self._sorted.size)
+
+    @property
+    def approximate_size(self) -> int:
+        """Upper bound on the distinct count, without forcing a compaction.
+
+        Progress reporting runs on every index pass and must not trigger the
+        sort: doing so turns the accumulator into a repeated merge of the whole
+        array and costs more than the Python set it replaced.
+        """
+        return int(self._sorted.size) + self._pending_size
+
+    def _compact(self) -> None:
+        if not self._pending:
+            return
+        merged = np.concatenate([self._sorted, *self._pending])
+        self._sorted = np.unique(merged)
+        self._pending.clear()
+        self._pending_size = 0
+
+    def add_bucket(
+        self,
+        members: np.ndarray,
+        seed: bytes | None = None,
+        source: str = "seed",
+    ) -> None:
+        """Record every unordered pair inside one bucket."""
+        count = len(members)
+        if count < 2:
+            return
+        if count > self.largest_bucket:
+            self.largest_bucket = count
+            self.largest_bucket_seed = seed
+            self.largest_bucket_source = source
+        left_index, right_index = np.triu_indices(count, k=1)
+        left = members[left_index].astype(np.int64)
+        right = members[right_index].astype(np.int64)
+        low = np.minimum(left, right)
+        high = np.maximum(left, right)
+        self._pending.append(low * self.read_count + high)
+        self._pending_size += len(low)
+        if self._pending_size >= self.block:
+            self._compact()
+            if self._sorted.size > self.limit:
+                raise MemoryError(self._limit_message())
+
+    def _limit_message(self) -> str:
+        pairs = self.largest_bucket * (self.largest_bucket - 1) // 2
+        if self.largest_bucket_source == "exact":
+            what = (
+                f"{self.largest_bucket:,} read pairs with byte-identical R1 and "
+                "R2, matched by the full-pair hash rather than by a seed"
             )
+            advice = (
+                "Lower --max-exact-family (5,000 by default) to reject such a "
+                "family outright, or remove the reads upstream. --max-seed-bucket "
+                "does not apply to this path."
+            )
+        else:
+            seed = (
+                self.largest_bucket_seed.decode("ascii", "replace")
+                if self.largest_bucket_seed
+                else "an unrecorded seed"
+            )
+            what = (
+                f"{self.largest_bucket:,} reads sharing the exact seed '{seed}'"
+            )
+            advice = (
+                "Lower --max-seed-bucket (500 by default; a bucket of 500 alone "
+                "contributes 124,750 pairs), raise --seed-length so seeds "
+                "discriminate better, or set --min-seed-entropy near 1.0 to drop "
+                "homopolymer seeds. Note that excluding these reads also removes "
+                "them from the multiple-testing correction, which loosens the "
+                "threshold for everything else, so pair it with a stricter --fdr."
+            )
+        return (
+            f"Candidate count exceeded --max-candidates={self.limit:,}. "
+            f"The largest bucket held {what}, which alone contributes "
+            f"{pairs:,} pairs. A bucket that large is usually adapter, poly-G or "
+            f"another low-complexity sequence rather than real duplication, "
+            f"because genuine duplicate families hold a handful of reads. "
+            f"{advice} Raising --max-candidates instead costs about 8 bytes per "
+            "pair for the index, plus the per-candidate scoring arrays."
+        )
+
+    def check_limit(self) -> None:
+        if len(self) > self.limit:
+            raise MemoryError(self._limit_message())
+
+    def to_arrays(self) -> tuple[np.ndarray, np.ndarray]:
+        self._compact()
+        return self._sorted // self.read_count, self._sorted % self.read_count
 
 
 def choose_seed_length(
@@ -694,6 +813,7 @@ def find_candidates(
     max_seed_bucket: int,
     max_exact_family: int,
     max_candidates: int,
+    min_seed_entropy: float,
     logger: RunLogger,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
     lane_indices: dict[int, list[int]] = defaultdict(list)
@@ -705,9 +825,11 @@ def find_candidates(
     offsets2 = seed_offsets(reads.read2_length, seed_length)
     total_steps = len(lane_indices) * (1 + len(offsets1) + len(offsets2))
     tracker = logger.tracker("candidate_search", total_steps, "index_passes")
-    candidates: set[int] = set()
+    candidates = CandidateSet(reads.count, max_candidates)
     skipped_seed_buckets = 0
     skipped_seed_members = 0
+    skipped_low_complexity = 0
+    largest_skipped = 0
     exact_families = 0
     exact_pair_relations = 0
     completed_steps = 0
@@ -731,11 +853,16 @@ def find_candidates(
                 )
             exact_families += 1
             exact_pair_relations += len(members) * (len(members) - 1) // 2
-            add_all_pairs(members, candidates, reads.count, max_candidates)
+            candidates.add_bucket(
+                np.asarray(members, dtype=np.int64), source="exact"
+            )
         completed_steps += 1
         tracker.update(
             completed_steps,
-            detail=f"candidates={len(candidates):,} lane={reads.lane_labels[lane_id]}",
+            detail=(
+                f"candidates<={candidates.approximate_size:,} "
+                f"lane={reads.lane_labels[lane_id]}"
+            ),
         )
 
         for mate_number, sequences, offsets in (
@@ -747,20 +874,28 @@ def find_candidates(
                 stop = offset + seed_length
                 for index in indices:
                     buckets[sequences[index][offset:stop]].append(index)
-                for members in buckets.values():
+                for seed, members in buckets.items():
                     if len(members) < 2:
                         continue
                     if len(members) > max_seed_bucket:
                         skipped_seed_buckets += 1
                         skipped_seed_members += len(members)
+                        largest_skipped = max(largest_skipped, len(members))
                         continue
-                    add_all_pairs(members, candidates, reads.count, max_candidates)
+                    if min_seed_entropy > 0.0 and seed_entropy(seed) < min_seed_entropy:
+                        # A homopolymer or near-homopolymer seed matches reads
+                        # that share nothing but low-complexity sequence, and a
+                        # bucket of k of them still costs k(k-1)/2 pairs.
+                        skipped_low_complexity += 1
+                        skipped_seed_members += len(members)
+                        continue
+                    candidates.add_bucket(np.asarray(members, dtype=np.int64), seed)
                 completed_steps += 1
                 tracker.update(
                     completed_steps,
                     detail=(
-                        f"candidates={len(candidates):,} mate=R{mate_number} "
-                        f"offset={offset}"
+                        f"candidates<={candidates.approximate_size:,} "
+                        f"mate=R{mate_number} offset={offset}"
                     ),
                 )
 
@@ -770,7 +905,8 @@ def find_candidates(
             f"skipped_seed_buckets={skipped_seed_buckets:,}"
         )
     )
-    edge_left, edge_right = decode_pair_keys(candidates, reads.count)
+    candidates.check_limit()
+    edge_left, edge_right = candidates.to_arrays()
     details = {
         "seed_length": seed_length,
         "r1_seed_offsets": offsets1,
@@ -779,6 +915,10 @@ def find_candidates(
         "exact_sequence_pair_relations": exact_pair_relations,
         "retrieved_candidate_pair_relations": len(candidates),
         "skipped_high_frequency_seed_buckets": skipped_seed_buckets,
+        "largest_skipped_seed_bucket": largest_skipped,
+        "skipped_low_complexity_seed_buckets": skipped_low_complexity,
+        "minimum_seed_entropy": min_seed_entropy,
+        "largest_retained_seed_bucket": candidates.largest_bucket,
         "members_in_skipped_seed_buckets_with_multiplicity": skipped_seed_members,
         "max_seed_bucket": max_seed_bucket,
         "max_exact_family": max_exact_family,
@@ -3445,10 +3585,35 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--min-seed-entropy",
+        type=float,
+        default=0.0,
+        help=(
+            "Skip seeds whose Shannon entropy in bits per base falls below "
+            "this; 0 disables the screen. Random sequence scores near 2 and a "
+            "homopolymer scores 0, so a value around 1.0 drops poly-G and "
+            "adapter runs that match on low-complexity sequence alone while "
+            "still costing k(k-1)/2 pairs. Off by default because dropping "
+            "those reads also removes them from the multiple-testing "
+            "correction, which changes the calls for everything else; it is a "
+            "lever for runs that will not otherwise fit, not a free win"
+        ),
+    )
+    parser.add_argument(
         "--max-seed-bucket",
         type=int,
         default=500,
-        help="Skip larger non-informative seed buckets",
+        help=(
+            "Skip seed buckets holding more than this many reads. A bucket of "
+            "k reads costs k(k-1)/2 candidate pairs, so the cap is what bounds "
+            "retrieval on a large run; a bucket of 500 alone contributes "
+            "124,750 pairs. Real duplicate families hold a handful of reads, "
+            "so large buckets are almost always low-complexity sequence that "
+            "the quality model then discards anyway. Lowering it is the main "
+            "lever for a run that will not fit, but it is not free: those "
+            "reads also leave the multiple-testing correction, which loosens "
+            "the threshold for everything else"
+        ),
     )
     parser.add_argument(
         "--max-exact-family",
@@ -3506,6 +3671,8 @@ def validate_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser
         parser.error("--seed-length must be at least 8")
     if args.max_seed_bucket < 2 or args.max_exact_family < 2:
         parser.error("candidate family limits must be at least 2")
+    if not (0.0 <= args.min_seed_entropy <= 2.0):
+        parser.error("--min-seed-entropy must be between 0 and 2 bits per base")
     if args.max_candidates < 1 or args.score_chunk < 1:
         parser.error("candidate/chunk limits must be positive")
     if args.tile_gap < 0:
@@ -3609,6 +3776,7 @@ def main(argv: list[str] | None = None) -> int:
             args.max_seed_bucket,
             args.max_exact_family,
             args.max_candidates,
+            args.min_seed_entropy,
             logger,
         )
         candidate_details["seed_length_selection"] = seed_details
@@ -4007,6 +4175,7 @@ def main(argv: list[str] | None = None) -> int:
                 "spatial_test": args.spatial_test,
                 "permutations": args.permutations,
                 "min_log10_bayes_factor": args.min_log10_bayes_factor,
+                "min_seed_entropy": args.min_seed_entropy,
                 "adaptive_seed": args.adaptive_seed,
                 "sequence_min_p": args.sequence_min_p,
                 "spatial_metric": args.spatial_metric,

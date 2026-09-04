@@ -37,6 +37,7 @@ two negative controls built from the data.
 - [Where this fits in a pipeline](#where-this-fits-in-a-pipeline)
 - [Outputs](#outputs)
 - [Options](#options)
+- [Large runs and memory](#large-runs-and-memory)
 - [Benchmarks](#benchmarks)
 - [How the model works](#how-the-model-works)
 - [Scope and limitations](#scope-and-limitations)
@@ -466,7 +467,8 @@ sensible run. Everything below is optional.
 | `--adaptive-seed` | on | let the base qualities shorten the seed. `--no-adaptive-seed` pins it |
 | `--min-log10-bayes-factor` | `0.0` | sequence evidence a candidate needs to be tested at all |
 | `--sequence-min-p` | `0.0` | optional extra Poisson-binomial compatibility screen; `0` disables |
-| `--max-seed-bucket` | `500` | skip larger, uninformative seed buckets |
+| `--max-seed-bucket` | `500` | skip seed buckets larger than this; the main lever for a run that will not fit — see [Large runs and memory](#large-runs-and-memory) |
+| `--min-seed-entropy` | `0.0` | skip low-entropy seeds (homopolymer, poly-G); `0` disables |
 | `--max-exact-family` | `5000` | abort on larger exact families (adapter/low-complexity artifacts) |
 | `--max-candidates` | `5000000` | safety limit on retrieved relations |
 
@@ -504,6 +506,71 @@ log and the report state which was chosen and why.
 | `by` | none (Benjamini-Yekutieli) | you want to under-remove by construction; costs ~`log(m)` |
 | `bh` | positive regression dependence | comparison against conventional pipelines |
 | `weighted-bh` | sequence evidence independent of position | sensitivity analysis, `--inference-unit edge` only |
+
+---
+
+## Large runs and memory
+
+Candidate retrieval, not the statistical model, is what limits scale. A seed
+bucket holding `k` reads contributes `k(k-1)/2` candidate pairs, so cost grows
+with the *square* of the largest bucket rather than with read count. One bucket
+of 500 reads is already 124,750 pairs.
+
+If a run stops with
+
+```
+MemoryError: Candidate count exceeded --max-candidates=...
+```
+
+raising `--max-candidates` is usually the wrong response. The message names the
+bucket responsible and whether it came from the seed index or the full-pair
+hash; read that first, because a bucket of thousands of reads sharing one exact
+20-mer is adapter, poly-G or another low-complexity sequence, not real
+duplication. Genuine duplicate families hold a handful of reads.
+
+`--max-seed-bucket` is the effective lever. Measured on a simulated 1M-read run
+at 151 bp:
+
+| `--max-seed-bucket` | candidates | tested edges | reads removed | peak RSS |
+|---:|---:|---:|---:|---:|
+| 500 (default) | 11,822,602 | 4,789,652 | 41,038 | 6.6 GB |
+| 100 | 4,969,428 | 4,789,652 | **41,038** | 5.6 GB |
+| 25 | 4,837,272 | 4,789,652 | **41,038** | 4.9 GB |
+
+Candidates fall by 59% while the tested set and the calls are unchanged: the
+extra pairs were all discarded by the sequence model anyway.
+
+**It is not free, though.** Excluding those reads also removes them from the
+multiple-testing correction, which loosens the threshold for everything else.
+On the benchmark simulation, which contains a 259-read poly-G family:
+
+| setting | removed | sensitivity | read-level FDR |
+|:---|---:|---:|---:|
+| default (bucket 500, `--fdr 0.01`) | 1,579 | 98.6% | 0.89% |
+| bucket 100, `--fdr 0.01` | 1,601 | 98.8% | **2.06%** |
+| bucket 100, `--fdr 0.005` | 1,568 | 98.6% | **0.26%** |
+
+So pair a lower bucket cap with a stricter target:
+
+```bash
+--max-seed-bucket 100 --fdr 0.005
+```
+
+That reproduces the default result while cutting retrieval several-fold. Other
+levers, in rough order of usefulness:
+
+| lever | effect |
+|:---|:---|
+| `--max-seed-bucket 100` | 3–10× fewer candidates; pair with a stricter `--fdr` |
+| `--seed-length 32` | longer seeds collide far less; costs sensitivity on low-quality reads |
+| `--min-seed-entropy 1.0` | drops homopolymer seeds; same correction caveat as above |
+| `--max-exact-family` | governs the full-pair hash path, which `--max-seed-bucket` does not touch |
+| remove adapter-dimers upstream | a length filter, not trimming — see [Where this fits in a pipeline](#one-case-for-pre-filtering) |
+
+Candidate keys are held as sorted `int64` rather than in a Python set, which
+costs about 8 bytes per pair instead of roughly 60. Budget on that basis when
+choosing `--max-candidates`, and remember the per-candidate scoring arrays are
+allocated on top.
 
 ---
 
