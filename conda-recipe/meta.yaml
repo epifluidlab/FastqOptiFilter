@@ -40,12 +40,17 @@ requirements:
     # matplotlib-base avoids pulling a GUI toolkit; the tool renders to PNG
     # through the Agg backend and never opens a window.
     - matplotlib-base >=3.7
+    # Output compression is otherwise single-threaded and was 41% of wall time
+    # on a 2M-pair benchmark. Optional at run time -- the tool falls back to
+    # Python gzip when pigz is absent -- but a conda install may as well have it.
+    - pigz
 
 test:
   imports:
     - fastq_optifilter
   commands:
     - fastqoptifilter --help
+    - pigz --version
     - python -c "from fastq_optifilter import VERSION; assert VERSION == '{{ version }}'"
 
 about:

@@ -90,10 +90,16 @@ class LoadedReads:
     tiles: np.ndarray
     x: np.ndarray
     y: np.ndarray
-    sequence1: list[bytes]
-    sequence2: list[bytes]
-    quality1: list[bytes]
-    quality2: list[bytes]
+    # R1 and R2 concatenated along the cycle axis, one row per read pair.
+    # Bases are 0-3 for ACGT and 4 for anything else; qualities are Phred
+    # scores clipped to 0-60. Holding these instead of the original bytes
+    # objects is the single largest memory saving available: a Python bytes
+    # object costs about 1 kB per read pair once headers and list pointers are
+    # counted, against 604 B for the two uint8 rows that carry the same
+    # information and can be sliced without allocating.
+    bases: np.ndarray
+    qualities: np.ndarray
+    quality_sums: np.ndarray
     unparsed_headers: int
     read1_length: int
     read2_length: int
@@ -101,21 +107,6 @@ class LoadedReads:
     @property
     def count(self) -> int:
         return len(self.names)
-
-    def release_sequences(self) -> None:
-        """Drop the raw bases and qualities once nothing needs them again.
-
-        They are read twice: by the seed index and by the encoder that turns
-        them into uint8 matrices. After that the matrices carry everything the
-        models use, and the filtered FASTQs are written by re-reading the input
-        rather than from memory. Holding the Python bytes objects past that
-        point costs about a kilobyte per read pair -- a third of peak footprint
-        on a large run -- for data that is already stored more compactly.
-        """
-        self.sequence1 = []
-        self.sequence2 = []
-        self.quality1 = []
-        self.quality2 = []
 
 
 @dataclass
@@ -498,12 +489,42 @@ def build_geometry(
     )
 
 
+def count_fastq_records(path: Path, logger: RunLogger) -> int:
+    """Count records in a FASTQ by counting newlines, without decoding them.
+
+    One cheap pass over the file buys an exact allocation for the base and
+    quality matrices. Growing them instead, or concatenating per-chunk pieces
+    at the end, needs both the pieces and the result live at once and so
+    doubles peak memory at exactly the point where it is already highest.
+    """
+    newlines = 0
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rb") as handle:
+        while True:
+            block = handle.read(1 << 22)
+            if not block:
+                break
+            newlines += block.count(b"\n")
+    logger.log("count_records", f"file={path.name} records={newlines // 4:,}")
+    return newlines // 4
+
+
 def load_fastqs(
     r1_path: Path,
     r2_path: Path,
     unparsed_action: str,
     logger: RunLogger,
+    chunk: int = 65_536,
 ) -> LoadedReads:
+    """Read both mates into uint8 matrices rather than Python bytes objects.
+
+    Records are converted in chunks and the chunks concatenated once at the
+    end, so the transient cost is one chunk rather than a full-length join of
+    every sequence. Encoding here instead of in a later pass means the original
+    bytes objects never have to be retained: on a large run they are the single
+    biggest allocation, at roughly a kilobyte per read pair against 604 bytes
+    for the two uint8 rows holding the same information.
+    """
     names: list[str] = []
     lane_labels: list[str] = []
     lane_to_id: dict[str, int] = {}
@@ -511,15 +532,33 @@ def load_fastqs(
     tiles: list[int] = []
     x_values: list[int] = []
     y_values: list[int] = []
-    sequence1: list[bytes] = []
-    sequence2: list[bytes] = []
-    quality1: list[bytes] = []
-    quality2: list[bytes] = []
+    pending_sequence: list[bytes] = []
+    pending_quality: list[bytes] = []
     unparsed = 0
     read1_length: int | None = None
     read2_length: int | None = None
+    expected = count_fastq_records(r1_path, logger)
+    bases: np.ndarray | None = None
+    qualities: np.ndarray | None = None
+    filled = 0
     total_bytes = r1_path.stat().st_size + r2_path.stat().st_size
     tracker = logger.tracker("load_fastq", total_bytes, "compressed_bytes")
+
+    def flush() -> None:
+        nonlocal filled
+        if not pending_sequence:
+            return
+        rows = len(pending_sequence) // 2
+        cycles = bases.shape[1]
+        raw = np.frombuffer(b"".join(pending_sequence), dtype=np.uint8)
+        bases[filled : filled + rows] = BASE_LOOKUP[raw].reshape(rows, cycles)
+        raw_quality = np.frombuffer(b"".join(pending_quality), dtype=np.uint8)
+        qualities[filled : filled + rows] = np.clip(
+            raw_quality.astype(np.int16) - 33, 0, 60
+        ).astype(np.uint8).reshape(rows, cycles)
+        filled += rows
+        pending_sequence.clear()
+        pending_quality.clear()
 
     with open_input(r1_path) as r1_handle, open_input(r2_path) as r2_handle:
         record_number = 0
@@ -542,6 +581,9 @@ def load_fastqs(
             if read1_length is None:
                 read1_length = len(r1.sequence)
                 read2_length = len(r2.sequence)
+                cycles = read1_length + read2_length
+                bases = np.empty((expected, cycles), dtype=np.uint8)
+                qualities = np.empty((expected, cycles), dtype=np.uint8)
             elif len(r1.sequence) != read1_length or len(r2.sequence) != read2_length:
                 raise ValueError(
                     "FastqOptiFilter currently requires fixed-length raw FASTQs; found "
@@ -569,20 +611,29 @@ def load_fastqs(
             tiles.append(tile)
             x_values.append(x)
             y_values.append(y)
-            sequence1.append(r1.sequence)
-            sequence2.append(r2.sequence)
-            quality1.append(r1.quality)
-            quality2.append(r2.quality)
+            pending_sequence.append(r1.sequence)
+            pending_sequence.append(r2.sequence)
+            pending_quality.append(r1.quality)
+            pending_quality.append(r2.quality)
+            if len(names) % chunk == 0:
+                flush()
 
             completed = compressed_position(r1_handle, r1_path) + compressed_position(
                 r2_handle, r2_path
             )
             tracker.update(completed, detail=f"pairs={len(names):,}")
 
+    flush()
     tracker.finish(detail=f"pairs={len(names):,} unparsed={unparsed:,}")
     if not names:
         raise ValueError("The FASTQ files contain no read pairs")
     assert read1_length is not None and read2_length is not None
+    if filled != expected:
+        # The counting pass and the record loop disagreed, which means the file
+        # changed underneath us or is malformed. Trim rather than ship a matrix
+        # padded with uninitialised memory.
+        bases = bases[:filled]
+        qualities = qualities[:filled]
     return LoadedReads(
         names=names,
         lane_labels=lane_labels,
@@ -590,10 +641,9 @@ def load_fastqs(
         tiles=np.asarray(tiles, dtype=np.int32),
         x=np.asarray(x_values, dtype=np.int32),
         y=np.asarray(y_values, dtype=np.int32),
-        sequence1=sequence1,
-        sequence2=sequence2,
-        quality1=quality1,
-        quality2=quality2,
+        bases=bases,
+        qualities=qualities,
+        quality_sums=qualities.sum(axis=1, dtype=np.int64),
         unparsed_headers=unparsed,
         read1_length=read1_length,
         read2_length=read2_length,
@@ -788,8 +838,18 @@ def choose_seed_length(
     key, and anything shorter turns the index into noise. The requested length
     is the ceiling, so good data is never given shorter seeds than asked for.
     """
-    error = np.power(10.0, -matrices.qualities.astype(np.float64) / 10.0)
-    mean_error = np.clip(error.mean(axis=0), 0.0, 0.75)
+    # Accumulate the per-cycle mean error in row blocks. Converting the whole
+    # quality matrix to float64 first would cost eight bytes per cycle per read
+    # -- five gigabytes on a two-million-pair run -- to produce one number per
+    # cycle. Phred scores are small integers, so a lookup table indexed by the
+    # raw byte gives the same answer with a bounded working set.
+    error_of_phred = np.power(10.0, -np.arange(256, dtype=np.float64) / 10.0)
+    qualities = matrices.qualities
+    total_error = np.zeros(qualities.shape[1], dtype=np.float64)
+    block = 65_536
+    for start in range(0, qualities.shape[0], block):
+        total_error += error_of_phred[qualities[start : start + block]].sum(axis=0)
+    mean_error = np.clip(total_error / max(qualities.shape[0], 1), 0.0, 0.75)
     per_cycle_mismatch = 2.0 * mean_error - (4.0 / 3.0) * mean_error**2
     expected_mismatches = float(per_cycle_mismatch.sum())
     cycles = int(matrices.qualities.shape[1])
@@ -852,11 +912,10 @@ def find_candidates(
     for lane_id, indices in sorted(lane_indices.items()):
         exact_groups: dict[bytes, list[int]] = defaultdict(list)
         for index in indices:
-            digest = hashlib.blake2b(digest_size=20)
-            digest.update(reads.sequence1[index])
-            digest.update(b"\x00")
-            digest.update(reads.sequence2[index])
-            exact_groups[digest.digest()].append(index)
+            # The encoded row is a faithful stand-in for the original bases:
+            # one byte per cycle, both mates concatenated, case already
+            # normalised by the lookup table.
+            exact_groups[reads.bases[index].tobytes()].append(index)
         for members in exact_groups.values():
             if len(members) < 2:
                 continue
@@ -880,15 +939,17 @@ def find_candidates(
             ),
         )
 
-        for mate_number, sequences, offsets in (
-            (1, reads.sequence1, offsets1),
-            (2, reads.sequence2, offsets2),
+        for mate_number, mate_start, offsets in (
+            (1, 0, offsets1),
+            (2, reads.read1_length, offsets2),
         ):
             for offset in offsets:
                 buckets: dict[bytes, list[int]] = defaultdict(list)
-                stop = offset + seed_length
+                start = mate_start + offset
+                stop = start + seed_length
+                seed_view = reads.bases[:, start:stop]
                 for index in indices:
-                    buckets[sequences[index][offset:stop]].append(index)
+                    buckets[seed_view[index].tobytes()].append(index)
                 for seed, members in buckets.items():
                     if len(members) < 2:
                         continue
@@ -942,51 +1003,27 @@ def find_candidates(
 
 
 def encode_matrices(reads: LoadedReads, logger: RunLogger) -> SequenceMatrices:
-    tracker = logger.tracker("encode_sequences", 6, "steps")
-    count = reads.count
+    """Wrap the already-encoded rows and estimate the per-cycle base prior.
 
-    raw1 = np.frombuffer(b"".join(reads.sequence1), dtype=np.uint8).reshape(
-        count, reads.read1_length
-    )
-    bases1 = BASE_LOOKUP[raw1]
-    tracker.update(1, detail="R1_bases", force=True)
-    raw2 = np.frombuffer(b"".join(reads.sequence2), dtype=np.uint8).reshape(
-        count, reads.read2_length
-    )
-    bases2 = BASE_LOOKUP[raw2]
-    tracker.update(2, detail="R2_bases", force=True)
-    bases = np.concatenate((bases1, bases2), axis=1)
-    del raw1, raw2, bases1, bases2
-
-    raw_quality1 = np.frombuffer(b"".join(reads.quality1), dtype=np.uint8).reshape(
-        count, reads.read1_length
-    )
-    quality1 = np.clip(raw_quality1.astype(np.int16) - 33, 0, 60).astype(np.uint8)
-    tracker.update(3, detail="R1_qualities", force=True)
-    raw_quality2 = np.frombuffer(b"".join(reads.quality2), dtype=np.uint8).reshape(
-        count, reads.read2_length
-    )
-    quality2 = np.clip(raw_quality2.astype(np.int16) - 33, 0, 60).astype(np.uint8)
-    tracker.update(4, detail="R2_qualities", force=True)
-    qualities = np.concatenate((quality1, quality2), axis=1)
-    quality_sums = qualities.sum(axis=1, dtype=np.int64)
-    del raw_quality1, raw_quality2, quality1, quality2
-
+    The bases and qualities were converted while the FASTQs were read, so this
+    step no longer copies them; it only derives the empirical base composition
+    that the latent-template likelihood uses as a prior.
+    """
+    tracker = logger.tracker("encode_sequences", 2, "steps")
+    bases = reads.bases
     base_priors = np.empty((bases.shape[1], 4), dtype=np.float64)
     for cycle in range(bases.shape[1]):
         counts = np.bincount(bases[:, cycle], minlength=5)[:4].astype(np.float64)
         counts += 1.0  # Dirichlet(1,1,1,1) smoothing.
         base_priors[cycle] = counts / counts.sum()
-    tracker.update(5, detail="empirical_cycle_base_priors", force=True)
-    tracker.update(6, detail="matrices_ready", force=True)
-    tracker.finish(
-        detail=f"shape={bases.shape[0]:,}x{bases.shape[1]:,} bases"
-    )
+    tracker.update(1, detail="empirical_cycle_base_priors", force=True)
+    tracker.update(2, detail="matrices_ready", force=True)
+    tracker.finish(detail=f"shape={bases.shape[0]:,}x{bases.shape[1]:,} bases")
     return SequenceMatrices(
         bases=bases,
-        qualities=qualities,
+        qualities=reads.qualities,
         base_priors=base_priors,
-        quality_sums=quality_sums,
+        quality_sums=reads.quality_sums,
     )
 
 
@@ -3795,9 +3832,6 @@ def main(argv: list[str] | None = None) -> int:
             logger,
         )
         candidate_details["seed_length_selection"] = seed_details
-        # The seed index and the encoder were the last readers of the raw
-        # bases and qualities; everything downstream uses the uint8 matrices.
-        reads.release_sequences()
         scores = score_candidates(
             edge_left,
             edge_right,

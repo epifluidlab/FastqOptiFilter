@@ -138,7 +138,7 @@ coordinates are used whether or not a read ever maps.
 |:---|:---|
 | **Python** | ≥ 3.11 (developed and tested on 3.14) — the floor comes from SciPy, see below |
 | **OS** | Linux or macOS |
-| **Memory** | roughly 4 GB per million read pairs |
+| **Memory** | ~0.6 GB fixed plus ~1.5 KB per read pair — about 3 GB at 2M pairs, 28 GB at 20M |
 | **Input** | synchronized paired-end FASTQ (`.fastq` or `.fastq.gz`), fixed read length, Illumina-style read names |
 
 ### Python packages
@@ -155,10 +155,18 @@ matplotlib>=3.7
 > message. SciPy 1.17 was never released for Python 3.10, which is what sets
 > the Python floor at 3.11 — the FastqOptiFilter source itself is 3.10-clean.
 
-### Optional
+### Strongly recommended
 
-- **`pigz`** — used automatically for parallel output compression when present
-  on `PATH`. Everything else is threaded via `--threads` regardless.
+- **`pigz`** — parallel gzip, used automatically for the output FASTQs when it
+  is on `PATH`. Without it, compression falls back to single-threaded Python
+  gzip, which was **41% of wall time** on a 2M-pair benchmark. The conda
+  package installs it as a dependency; with pip, install it separately:
+
+  ```bash
+  conda install -c conda-forge pigz     # or: apt install pigz / brew install pigz
+  ```
+
+  Everything else is threaded via `--threads` regardless.
 
 ### Input requirements
 
@@ -221,12 +229,20 @@ environment while putting the command on your `PATH`:
 pipx install fastqoptifilter
 ```
 
+`pip` cannot install `pigz`, which is a binary rather than a Python package.
+Add it with your system package manager — see
+[Strongly recommended](#strongly-recommended) — or use the conda route below,
+which includes it.
+
 ### Option B — conda / mamba
 
 ```bash
 conda create -n fastqoptifilter -c conda-forge -c bioconda fastqoptifilter
 conda activate fastqoptifilter
 ```
+
+This route also brings in `pigz`, which parallelises output compression; the
+pip route does not, so install it separately there.
 
 `-c conda-forge` matters: SciPy 1.17+ comes from conda-forge, not from the
 `defaults` channel. If your conda is old enough that the solve is slow, `mamba`
@@ -724,11 +740,39 @@ model discards the extra collisions.
 
 | | |
 |:---|---:|
-| 40,000 read pairs, 4 threads | ~6 s |
-| 400,000 read pairs, 8 threads | **107 s**, 1.7 GB peak RSS |
+Measured on an Apple M-series laptop (8 cores), 151 bp reads, a realistic
+duplicate load, 20 permutation replicates, **without `pigz`**:
 
-Measured on an Apple M-series laptop, including 20 permutation replicates, both
-plots and all audit files.
+| read pairs | peak RSS | wall |
+|---:|---:|---:|
+| 250,000 | 0.99 GB | 27 s |
+| 500,000 | 1.28 GB | 58 s |
+| 1,000,000 | 2.04 GB | 133 s |
+| 2,000,000 | 3.34 GB | 322 s |
+
+That fits **0.64 GB fixed + ~1,456 B per read pair**, with wall time scaling as
+roughly `n^1.19`. Extrapolating (and it is an extrapolation, not a measurement):
+
+| read pairs | RSS | wall |
+|---:|---:|---:|
+| 20M | ~28 GB | ~1.3 h |
+| 100M | ~136 GB | ~9 h |
+| 500M | ~680 GB | ~60 h |
+
+So 20M fits comfortably on a 64 GB node. 100M needs a large-memory machine, and
+500M is not currently practical — everything is held in RAM at once, and the
+fix for that is chunking by tile neighbourhood rather than a faster language.
+
+Three things move these numbers a lot:
+
+- **Install `pigz`.** Output compression was 41% of wall time in the table
+  above, single-threaded, because pigz was absent.
+- **Heavy duplication costs more than read count does.** A 1M-pair run with a
+  heavy adapter and poly-G load took 545 s against 133 s for the same read
+  count here, because candidate pairs grow with the *square* of each
+  sequence-sharing class. See [Large runs and memory](#large-runs-and-memory).
+- **`--permutations 5`** instead of 20 cuts roughly a quarter of the wall time
+  at some cost in FDR resolution.
 
 ---
 
