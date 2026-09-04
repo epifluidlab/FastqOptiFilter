@@ -102,6 +102,21 @@ class LoadedReads:
     def count(self) -> int:
         return len(self.names)
 
+    def release_sequences(self) -> None:
+        """Drop the raw bases and qualities once nothing needs them again.
+
+        They are read twice: by the seed index and by the encoder that turns
+        them into uint8 matrices. After that the matrices carry everything the
+        models use, and the filtered FASTQs are written by re-reading the input
+        rather than from memory. Holding the Python bytes objects past that
+        point costs about a kilobyte per read pair -- a third of peak footprint
+        on a large run -- for data that is already stored more compactly.
+        """
+        self.sequence1 = []
+        self.sequence2 = []
+        self.quality1 = []
+        self.quality2 = []
+
 
 @dataclass
 class SequenceMatrices:
@@ -3780,6 +3795,9 @@ def main(argv: list[str] | None = None) -> int:
             logger,
         )
         candidate_details["seed_length_selection"] = seed_details
+        # The seed index and the encoder were the last readers of the raw
+        # bases and qualities; everything downstream uses the uint8 matrices.
+        reads.release_sequences()
         scores = score_candidates(
             edge_left,
             edge_right,
