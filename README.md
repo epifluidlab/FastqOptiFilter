@@ -2,7 +2,7 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22307671.svg)](https://doi.org/10.5281/zenodo.22307671)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-%E2%89%A5%203.10-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue.svg)](https://www.python.org/)
 
 Quality-aware, FDR-controlled removal of optical and proximity duplicates from
 synchronized paired-end Illumina FASTQ files — **before alignment**, using the
@@ -135,7 +135,7 @@ coordinates are used whether or not a read ever maps.
 
 | | |
 |:---|:---|
-| **Python** | ≥ 3.10 (developed and tested on 3.14) |
+| **Python** | ≥ 3.11 (developed and tested on 3.14) — the floor comes from SciPy, see below |
 | **OS** | Linux or macOS |
 | **Memory** | roughly 4 GB per million read pairs |
 | **Input** | synchronized paired-end FASTQ (`.fastq` or `.fastq.gz`), fixed read length, Illumina-style read names |
@@ -151,7 +151,8 @@ matplotlib>=3.7
 > **`scipy>=1.17` is a hard requirement.** FastqOptiFilter uses
 > `scipy.stats.poisson_binom`, which does not exist in earlier releases. A
 > too-old SciPy fails at import with a confusing `ImportError`, not a version
-> message.
+> message. SciPy 1.17 was never released for Python 3.10, which is what sets
+> the Python floor at 3.11 — the FastqOptiFilter source itself is 3.10-clean.
 
 ### Optional
 
@@ -180,10 +181,13 @@ be parsed abort the run unless `--unparsed keep` is given.
 
 Everything below installs the same tool. Pick one.
 
-> **Python must be 3.10 or newer**, and **SciPy 1.17 or newer**. Many systems
-> still default to Python 3.9. FastqOptiFilter uses `scipy.stats.poisson_binom`,
-> which does not exist before SciPy 1.17, and an older SciPy fails at import
-> with a confusing `ImportError` rather than a version message.
+> **Python must be 3.11 or newer.** FastqOptiFilter uses
+> `scipy.stats.poisson_binom`, which does not exist before SciPy 1.17, and no
+> SciPy 1.17 was ever built for Python 3.10 — so on 3.10 the install fails to
+> resolve rather than producing a working environment. Many systems still
+> default to 3.9 or 3.10. If you pin dependencies by hand, note that an older
+> SciPy fails at *import* with a confusing `ImportError` rather than a version
+> message.
 
 ### Option A — pip (recommended)
 

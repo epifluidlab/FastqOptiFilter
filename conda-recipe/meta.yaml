@@ -26,15 +26,16 @@ build:
 
 requirements:
   host:
-    - python >=3.10
+    - python >=3.11
     - pip
     - setuptools >=64
     - wheel
   run:
-    - python >=3.10
+    - python >=3.11
     - numpy >=1.26
     # Hard floor: scipy.stats.poisson_binom does not exist before 1.17, and an
     # older scipy fails at import rather than reporting a version problem.
+    # scipy 1.17 requires Python >=3.11, which is what sets the python pin above.
     - scipy >=1.17
     # matplotlib-base avoids pulling a GUI toolkit; the tool renders to PNG
     # through the Agg backend and never opens a window.

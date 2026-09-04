@@ -30,7 +30,7 @@ every run recomputes its p-values on a permutation of the position labels and
 on candidate pairs the quality model rejected as different molecules, and
 reports how far each departs from uniform. ``--qq-plot`` draws them.
 
-Requirements: Python >=3.10, numpy, scipy >=1.17, matplotlib. If pigz is available,
+Requirements: Python >=3.11, numpy, scipy >=1.17, matplotlib. If pigz is available,
 FastqOptiFilter uses it for parallel compression of the two output FASTQs.
 """
 

@@ -8,7 +8,9 @@ description = "Quality-aware, FDR-controlled optical and proximity duplicate fil
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
+# Set by SciPy, not by the language. The source itself parses under 3.10,
+# but no scipy >= 1.17 exists for 3.10, so pip cannot resolve there.
+requires-python = ">=3.11"
 dynamic = ["version"]
 authors = [{ name = "Yaping Liu", email = "lyping1986@gmail.com" }]
 maintainers = [{ name = "Yaping Liu", email = "lyping1986@gmail.com" }]
@@ -31,7 +33,6 @@ classifiers = [
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -40,7 +41,8 @@ classifiers = [
 
 # scipy >= 1.17 is a hard floor: FastqOptiFilter uses scipy.stats.poisson_binom,
 # which does not exist earlier. An older scipy fails at import rather than
-# reporting a version problem.
+# reporting a version problem. scipy 1.17 in turn requires Python >= 3.11,
+# which is what sets requires-python above.
 dependencies = [
     "numpy>=1.26",
     "scipy>=1.17",
