@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local sequencing test data (large FASTQs, not distributed)
+test_data/
