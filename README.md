@@ -30,6 +30,7 @@ two negative controls built from the data.
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [Where this fits in a pipeline](#where-this-fits-in-a-pipeline)
 - [Outputs](#outputs)
 - [Options](#options)
 - [Benchmarks](#benchmarks)
@@ -292,6 +293,89 @@ is being computed wrongly and the result should not be trusted. If the
 `sequence_incompatible` control is inflated, real reads carry spatial structure
 that within-lane exchangeability does not capture, and q-values are optimistic
 by roughly that factor.
+
+---
+
+## Where this fits in a pipeline
+
+**Run FastqOptiFilter first, on raw FASTQ, before adapter or quality trimming.**
+
+```
+raw FASTQ
+   ↓
+FastqOptiFilter          ← here
+   ↓
+adapter / quality trimming     (cutadapt, fastp, Trimmomatic …)
+   ↓
+alignment
+   ↓
+MarkDuplicates / UMI collapsing
+   ↓
+library complexity estimate    (EstimateLibraryComplexity, preseq)
+```
+
+### Why before trimming
+
+**It will not run on trimmed reads.** FastqOptiFilter requires fixed-length
+input and aborts otherwise:
+
+```
+ValueError: FastqOptiFilter currently requires fixed-length raw FASTQs;
+found lengths 151/151 at pair 2, expected 134/134
+```
+
+Trimming the MiSeq run benchmarked here produces 111 distinct read lengths, so
+it fails immediately. This is an implementation limit rather than a statistical
+one — `encode_matrices` builds a fixed *n* × cycles matrix, and variable lengths
+would need padding plus a validity mask — but as it stands it is a blocker.
+
+**Nothing is gained by trimming first.** Cluster coordinates are untouched by
+trimming, so the spatial model sees exactly the same geometry either way.
+
+**Adapter read-through does not fool the sequence filter.** The obvious worry is
+that two different short fragments both reading into the adapter will look like
+duplicates. They do not: the Bayes factor sums over all 302 cycles, so a shared
+adapter tail is overwhelmed by a mismatching insert. On the patterned run
+benchmarked here, 625,545 candidate relations were retrieved and only 40,125
+survived the sequence filter.
+
+**Less data reaches every downstream step.** On a run like the patterned one,
+you trim and align around 7% fewer reads.
+
+**Seed length is calibrated from the raw quality profile.** Quality trimming
+removes exactly the low-quality bases that calibration reads, pushing the seed
+length back toward the fixed default and losing the recall shown in
+[benchmark 5](#5-retrieval-under-poor-base-quality).
+
+For completeness: trimming does *not* damage duplicate detection, provided the
+trimmer is error-tolerant. On the MiSeq run, an exact-match trimmer loses 60% of
+duplicate pairs (20 → 8) because the adapter is found at different offsets in
+two copies of one molecule, while a trimmer allowing a single mismatch loses
+none (20 → 20). That is an argument about trimmer quality, not about ordering.
+
+### One case for pre-filtering
+
+Adapter-dimers and very short inserts form large low-complexity families that
+bloat the candidate set. In the patterned run, a single 259-read
+adapter-dimer/poly-G family generated **83% of all candidate relations**. Those
+reads were handled correctly — they received zero calls — but they cost runtime
+and inflate the hypothesis count.
+
+If a library is heavy in adapter-dimers, discard those reads first. That is a
+length or complexity filter, not adapter trimming: drop reads whose adapter
+begins before roughly cycle 20, which leaves every surviving read at full
+length and keeps the fixed-length requirement satisfied.
+
+### Downstream
+
+The filtered FASTQs are ordinary synchronized FASTQs and need no special
+handling. Removing proximity duplicates before `MarkDuplicates` is what makes
+the resulting duplicate rate mean what complexity estimators assume it means —
+see [Why this exists](#optical-duplicates-corrupt-library-complexity).
+
+If UMIs are present, prefer UMI-aware collapsing for molecular counting;
+FastqOptiFilter still helps by removing instrument-generated copies that share
+a UMI, but it is not a substitute.
 
 ---
 
