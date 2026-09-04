@@ -4,6 +4,15 @@ Quality-aware, FDR-controlled removal of optical and proximity duplicates from
 synchronized paired-end Illumina FASTQ files — **before alignment**, using the
 lane/tile/X/Y coordinates already present in the read names.
 
+**The point is library complexity.** Complexity and library-size estimators —
+Picard `EstimateLibraryComplexity`, `preseq`, and every yield extrapolation
+built on them — read the duplicate rate as evidence that you are resampling a
+finite pool of distinct molecules. Optical duplicates are not resampling. They
+are one molecule counted twice by the instrument, and every one of them left in
+the data drags the complexity estimate down and the predicted future yield with
+it. On the patterned-flowcell run benchmarked below, that mistake understates
+library size by **37-fold**, and it is the whole reason this tool exists.
+
 FastqOptiFilter applies **no fixed spatial-distance cutoff**. The length scale
 of duplication is estimated from the run itself, so the same command works on a
 patterned flowcell where duplicates spread over thousands of pixels and on a
@@ -34,20 +43,82 @@ two negative controls built from the data.
 
 ## Why this exists
 
-Optical and proximity duplicates are usually removed after alignment, by tools
-that flag a duplicate pair as "optical" when the two clusters fall within a
-fixed pixel distance — 100 px for non-patterned flowcells, 2500 px for
-patterned ones, by convention.
+### Optical duplicates corrupt library complexity
 
-Two problems follow. The constant has to be chosen per instrument, and choosing
-it wrong is how genuine library duplicates get destroyed: on the clean MiSeq
-run benchmarked below, the patterned setting flags **172** reads where the
-correct answer is **34**. And doing the work after alignment means the
-duplicates have already consumed sequencing depth and alignment time.
+Library complexity estimation rests on one assumption: that when you see the
+same molecule twice, you sampled the same molecule twice. From the duplicate
+rate, the standard Lander–Waterman relation
+
+```
+distinct molecules recovered = N · (1 − e^(−n/N))
+```
+
+is inverted to estimate `N`, the number of distinct molecules in the library.
+That estimate then drives everything downstream — whether a sample has enough
+complexity to call low-frequency variants, how deep to sequence next, whether
+to rebuild the library at all.
+
+An optical duplicate breaks the assumption. It is not a second sampling of a
+molecule from the library; it is one molecule that the instrument read twice,
+because a cluster was split during image analysis or, on a patterned flowcell,
+because the molecule seeded a neighbouring well. Counting it as a library
+duplicate inflates the apparent duplicate rate, and because the inversion above
+is steeply non-linear at low duplicate rates, a small absolute error becomes a
+large error in `N`.
+
+The patterned-flowcell run benchmarked below shows the size of it. Its raw
+duplicate rate is 6.21%, but essentially all of that is proximity duplication —
+of the ~3,763 duplicate pairs that should have landed on non-adjacent tiles if
+they were library duplicates, **two** did. After filtering, the true library
+duplicate rate is 0.175%.
+
+| | apparent duplicate rate | estimated library size | predicted useful fraction at 10× depth |
+|:---|---:|---:|---:|
+| optical duplicates left in | 6.21% | **702,000** molecules | 56.1% |
+| after FastqOptiFilter | 0.175% | **25,900,000** molecules | 98.3% |
+
+A **37-fold** underestimate of complexity, and a forecast that 44% of further
+sequencing would be wasted when in fact almost none of it would be. For cfDNA
+and other low-input applications, where complexity is the limiting factor for
+detecting rare variants, that is the difference between using a sample and
+discarding it.
+
+### The problem is growing, not shrinking
+
+Illumina has moved from non-patterned flowcells with randomly placed clusters —
+the legacy MiSeq, HiSeq 2500, NextSeq 500/550 — to patterned flowcells with
+ordered nanowells and ExAmp chemistry, including the iSeq series, NextSeq
+1000/2000, NovaSeq, and the current MiSeq i100 generation that replaces the
+legacy MiSeq. On a patterned flowcell a library molecule can seed a
+*neighbouring* well rather than only the one it landed in, so proximity
+duplicates are both far more common and spread far further.
+
+The two real runs benchmarked here bracket exactly that transition, and the
+tool measures the difference without being told about it:
+
+| | legacy non-patterned MiSeq | patterned flowcell |
+|:---|---:|---:|
+| reads in proximity duplication | 0.027% | **12.0%** |
+| length scale of the mechanism | 50 px | **5000 px** |
+
+Roughly 440× the rate and 100× the reach. Anyone whose duplicate-handling was
+tuned on non-patterned data is now applying it to a regime it was never
+calibrated for.
+
+### Why a fixed pixel threshold does not solve it
+
+The conventional fix flags a duplicate pair as optical when the two clusters
+fall within a fixed pixel distance — 100 px for non-patterned flowcells,
+2500 px for patterned ones, by convention. That constant has to be chosen per
+instrument, and choosing it wrong destroys genuine library duplicates: on the
+clean MiSeq run benchmarked below, the patterned setting flags **172** reads
+where the correct answer is **34**.
 
 FastqOptiFilter replaces the constant with a null built from the run's own
-cluster pattern, and controls a false discovery rate rather than applying a
-threshold.
+cluster pattern, estimates the length scale from the data, and controls a false
+discovery rate rather than applying a threshold. Working on FASTQ rather than
+BAM also means the correction is available before alignment, and the same
+coordinates are used whether or not a read ever maps.
 
 ---
 
@@ -378,6 +449,19 @@ at ≤ 4 — and using no coordinate, so it is independent of the spatial test):
 
 The 283 false positives are an upper bound: the truth caps at 4 mismatches, and
 3.3% of certain-optical pairs exceed that.
+
+The effect on complexity estimation, inverting `distinct = N(1 − e^(−n/N))` at
+n = 90,927 reads:
+
+| | duplicate rate | estimated library size |
+|:---|---:|---:|
+| unfiltered | 6.21% | 702,000 |
+| filtered | 0.175% | **25,900,000** |
+
+Extrapolating to ten times the depth, the unfiltered estimate predicts 510,000
+distinct molecules from 909,270 reads (56.1% useful); the filtered estimate
+predicts 894,000 (98.3%). The unfiltered numbers would justify abandoning a
+library that is in fact close to ideal.
 
 A 259-read adapter-dimer/poly-G family, contributing 83% of all candidate
 relations, received **zero** calls — the multiplicity term and the
