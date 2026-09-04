@@ -1,2 +1,591 @@
 # FastqOptiFilter
-Statistical modeling of optical-duplicate filtering for the Fastq files
+
+Quality-aware, FDR-controlled removal of optical and proximity duplicates from
+synchronized paired-end Illumina FASTQ files — **before alignment**, using the
+lane/tile/X/Y coordinates already present in the read names.
+
+FastqOptiFilter applies **no fixed spatial-distance cutoff**. The length scale
+of duplication is estimated from the run itself, so the same command works on a
+patterned flowcell where duplicates spread over thousands of pixels and on a
+non-patterned MiSeq where they sit within tens of pixels, without being told
+which is which.
+
+Every run also reports whether its own statistical null is calibrated, using
+two negative controls built from the data.
+
+---
+
+## Contents
+
+- [Why this exists](#why-this-exists)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Outputs](#outputs)
+- [Options](#options)
+- [Benchmarks](#benchmarks)
+- [How the model works](#how-the-model-works)
+- [Scope and limitations](#scope-and-limitations)
+- [Tests](#tests)
+- [Contact](#contact)
+- [License](#license)
+
+---
+
+## Why this exists
+
+Optical and proximity duplicates are usually removed after alignment, by tools
+that flag a duplicate pair as "optical" when the two clusters fall within a
+fixed pixel distance — 100 px for non-patterned flowcells, 2500 px for
+patterned ones, by convention.
+
+Two problems follow. The constant has to be chosen per instrument, and choosing
+it wrong is how genuine library duplicates get destroyed: on the clean MiSeq
+run benchmarked below, the patterned setting flags **172** reads where the
+correct answer is **34**. And doing the work after alignment means the
+duplicates have already consumed sequencing depth and alignment time.
+
+FastqOptiFilter replaces the constant with a null built from the run's own
+cluster pattern, and controls a false discovery rate rather than applying a
+threshold.
+
+---
+
+## Requirements
+
+### Prerequisites
+
+| | |
+|:---|:---|
+| **Python** | ≥ 3.10 (developed and tested on 3.14) |
+| **OS** | Linux or macOS |
+| **Memory** | roughly 4 GB per million read pairs |
+| **Input** | synchronized paired-end FASTQ (`.fastq` or `.fastq.gz`), fixed read length, Illumina-style read names |
+
+### Python packages
+
+```
+numpy>=1.26
+scipy>=1.17
+matplotlib>=3.7
+```
+
+> **`scipy>=1.17` is a hard requirement.** FastqOptiFilter uses
+> `scipy.stats.poisson_binom`, which does not exist in earlier releases. A
+> too-old SciPy fails at import with a confusing `ImportError`, not a version
+> message.
+
+### Optional
+
+- **`pigz`** — used automatically for parallel output compression when present
+  on `PATH`. Everything else is threaded via `--threads` regardless.
+
+### Input requirements
+
+Read names must carry coordinates in the standard Illumina layout, where the
+last three colon-separated fields are tile, X and Y:
+
+```
+@<instrument>:<run>:<flowcell>:<lane>:<tile>:<x>:<y>
+ └────────────── lane key ──────────────┘ └── position ──┘
+```
+
+Tile identifiers are decoded as `<surface><swath><tile>` (MiSeq, HiSeq,
+NovaSeq) or `<surface><swath><camera><tile>` (NextSeq). An unrecognised
+convention still runs, but tile adjacency becomes nominal rather than physical;
+the report always names the convention that was used. Reads whose names cannot
+be parsed abort the run unless `--unparsed keep` is given.
+
+---
+
+## Installation
+
+### 1. Clone
+
+```bash
+git clone https://github.com/epifluidlab/FastqOptiFilter.git
+cd FastqOptiFilter
+```
+
+### 2. Create an environment
+
+Pick whichever you use. **Check your Python version first** — many systems
+still default to 3.9, which cannot run this tool.
+
+<details open>
+<summary><b>venv</b> (recommended)</summary>
+
+```bash
+python3 --version          # must be 3.10 or newer
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r fastq_optifilter_requirements.txt
+```
+
+</details>
+
+<details>
+<summary><b>conda / mamba</b></summary>
+
+```bash
+conda create -n fastqoptifilter python=3.12
+conda activate fastqoptifilter
+pip install -r fastq_optifilter_requirements.txt
+```
+
+Install the packages with `pip` inside the conda environment, since
+`scipy>=1.17` may not yet be available on all conda channels.
+
+</details>
+
+<details>
+<summary><b>uv</b></summary>
+
+```bash
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install -r fastq_optifilter_requirements.txt
+```
+
+</details>
+
+### 3. Verify
+
+```bash
+python3 -c "from scipy.stats import poisson_binom; print('scipy OK')"
+python3 fastq_optifilter.py --help
+```
+
+### 4. Run the test suite (optional, ~5 minutes)
+
+This simulates data with known ground truth and asserts that the null is
+calibrated, that nothing is removed from a pure-null dataset, and that the
+nearby-tile search is what recovers cross-tile duplicates.
+
+```bash
+python3 test/test_calibration.py
+```
+
+Expect `16 passed, 0 failed`.
+
+---
+
+## Quick start
+
+Minimal:
+
+```bash
+python3 fastq_optifilter.py \
+  --r1 sample_R1.fastq.gz \
+  --r2 sample_R2.fastq.gz \
+  --output-r1 sample.filtered.R1.fastq.gz \
+  --output-r2 sample.filtered.R2.fastq.gz \
+  --report-json sample.report.json \
+  --threads 8
+```
+
+Recommended — adds the human-readable report, the per-read audit and the
+calibration plot, which are what let you check the result rather than trust it:
+
+```bash
+python3 fastq_optifilter.py \
+  --r1 sample_R1.fastq.gz \
+  --r2 sample_R2.fastq.gz \
+  --output-r1 sample.filtered.R1.fastq.gz \
+  --output-r2 sample.filtered.R2.fastq.gz \
+  --report-json sample.report.json \
+  --report-md   sample.report.md \
+  --read-audit  sample.reads.tsv.gz \
+  --removed-audit sample.removed.tsv.gz \
+  --qq-plot     sample.qq.png \
+  --log         sample.run.log \
+  --threads 8
+```
+
+`--threads 0` uses every detected core. Progress lines carry a stage,
+throughput, elapsed time and ETA, and go to both stderr and `--log`.
+
+### Reading the result
+
+Three numbers in `sample.report.md` tell you most of what happened:
+
+| field | meaning |
+|:---|:---|
+| **Reads involved in proximity duplication** | how much of the run is spatially duplicated |
+| **Length scale** | the distance at which that excess saturates — the mechanism's reach in this run |
+| **Max excess over uniform** (null calibration) | at or below zero means the p-values are valid |
+
+If the `permutation` control shows a max excess well above zero, the geometry
+is being computed wrongly and the result should not be trusted. If the
+`sequence_incompatible` control is inflated, real reads carry spatial structure
+that within-lane exchangeability does not capture, and q-values are optimistic
+by roughly that factor.
+
+---
+
+## Outputs
+
+| output | flag | contents |
+|:---|:---|:---|
+| Filtered FASTQs | `--output-r1/--output-r2` | remain synchronized and in input order |
+| JSON report | `--report-json` | configuration, decoded geometry, duplicate decomposition, null calibration, FDR sensitivity, counts |
+| Markdown report | `--report-md` | the same, readable |
+| Read audit | `--read-audit` | per tested read: nearest look-alike, its distance and tile, candidate partner count, local neighbour count, p-value, local FDR, every method's q-value, removed or not |
+| Candidate audit | `--candidate-audit` | the same per candidate relation |
+| Removed audit | `--removed-audit` | per removed read: which read was retained instead, and the evidence |
+| QQ plot | `--qq-plot` | null controls against a uniform null, plus local FDR against distance |
+| Diagnostic plot | `--diagnostic-plot` | observed spatial distribution against the geometry null |
+
+---
+
+## Options
+
+Defaults are chosen so that `--r1/--r2/--output-*/--report-json` alone gives a
+sensible run. Everything below is optional.
+
+### Core
+
+| option | default | what it does |
+|:---|:---|:---|
+| `--fdr` | `0.01` | target false discovery rate |
+| `--fdr-method` | `auto` | `auto`, `permutation`, `by`, `local-fdr`, `bh`, `weighted-bh` — see below |
+| `--threads` | `1` | worker threads; `0` uses all cores |
+| `--force` | off | overwrite existing outputs |
+
+### Spatial model
+
+| option | default | what it does |
+|:---|:---|:---|
+| `--tile-neighborhood` | `adjacent` | which tile relations may carry a spatial test: `same-tile`, `adjacent` (also the tiles touching a read's own), or `lane` (every tile on the surface; slower, but leaves no atom at `p = 1`) |
+| `--tile-gap` | `0` | pixels of dead space assumed between neighbouring tiles. Affects power only, never validity — observed distances and the null use the same frame |
+| `--max-grid-step` | `1` | tile-grid rings searched when the neighbourhood is `adjacent` |
+| `--spatial-metric` | `chebyshev` | `chebyshev` or `euclidean` |
+| `--inference-unit` | `read` | `read` tests each read once against its nearest look-alike; `edge` reproduces the older per-relation test |
+| `--permutations` | `20` | reshuffled replicates used to measure the FDR and the duplicate decomposition; `0` disables both |
+
+### Candidate retrieval
+
+| option | default | what it does |
+|:---|:---|:---|
+| `--seed-length` | `20` | **maximum** exact seed length; the qualities may select shorter |
+| `--adaptive-seed` | on | let the base qualities shorten the seed. `--no-adaptive-seed` pins it |
+| `--min-log10-bayes-factor` | `0.0` | sequence evidence a candidate needs to be tested at all |
+| `--sequence-min-p` | `0.0` | optional extra Poisson-binomial compatibility screen; `0` disables |
+| `--max-seed-bucket` | `500` | skip larger, uninformative seed buckets |
+| `--max-exact-family` | `5000` | abort on larger exact families (adapter/low-complexity artifacts) |
+| `--max-candidates` | `5000000` | safety limit on retrieved relations |
+
+### Advanced
+
+| option | default | what it does |
+|:---|:---|:---|
+| `--spatial-test` | on | `--no-spatial-test` removes every sequence-compatible candidate, ignoring geometry. **This is sequence-level deduplication, not optical filtering** |
+| `--auto-pi0-threshold` | `0.5` | with `--fdr-method auto`, use `local-fdr` below this estimated null proportion |
+| `--pi0-lambda` | `0.5` | Storey tuning point for the null proportion |
+| `--null-resolution` | `384` | log-spaced radii above 256 px at which the geometry null is tabulated |
+| `--null-check-seed` | `20260903` | seed for the permutation controls |
+| `--unparsed` | `error` | `keep` tolerates read names without coordinates |
+| `--gzip-level` | `6` | output compression level |
+| `--score-chunk` | `1000` | candidate relations per parallel scoring task |
+| `--progress-interval` | `10.0` | seconds between progress messages |
+
+### Choosing `--fdr-method`
+
+No single method suits every run, which is why the default is `auto`.
+
+A tail test — `bh`, `by`, `permutation` — asks whether a p-value is extreme
+against a uniform null. That question has the wrong answer once most hypotheses
+are genuinely non-null: a real duplicate far from its twin is unremarkable on
+its own, and only a fitted mixture knows that nearly everything around it is
+also a duplicate. `auto` selects `local-fdr` when the estimated null proportion
+`pi0` falls below `--auto-pi0-threshold`, and `permutation` otherwise. Both the
+log and the report state which was chosen and why.
+
+| method | assumption | use when |
+|:---|:---|:---|
+| `auto` | — | **default**; picks between the two below |
+| `permutation` | none — reshuffles the flowcell and measures the FDR directly | ordinary runs, sparse duplication |
+| `local-fdr` | alternative is present and estimable | duplicate-dominated runs (`pi0` small) |
+| `by` | none (Benjamini-Yekutieli) | you want to under-remove by construction; costs ~`log(m)` |
+| `bh` | positive regression dependence | comparison against conventional pipelines |
+| `weighted-bh` | sequence evidence independent of position | sensitivity analysis, `--inference-unit edge` only |
+
+---
+
+## Benchmarks
+
+Three independent evaluations: a simulation with full ground truth, two real
+runs of opposite character, and library duplicates spiked into real data at
+known rates.
+
+### 1. Simulation with ground truth
+
+`test/simulate_fastq.py` generates paired FASTQs with a truth table, including
+same-tile and cross-tile optical duplicates, library duplicates at independent
+positions, tile-to-tile and within-tile density variation, and a spatially
+clustered poly-G artifact. Scoring is family-aware: for a true optical family
+of size *k*, exactly *k−1* members should be removed, and it does not matter
+which is retained. 40,000 read pairs, three seeds.
+
+| configuration | removed | TP | FN | FP | sensitivity | FDR | cross-tile recall |
+|:---|---:|---:|---:|---:|---:|---:|---:|
+| **FastqOptiFilter** (seed 17) | 1,579 | 1,565 | 22 | 8 | **98.6%** | **0.51%** | **95.2%** |
+| **FastqOptiFilter** (seed 33) | 1,642 | 1,561 | 28 | 15 | **98.2%** | **0.91%** | **94.6%** |
+| **FastqOptiFilter** (seed 71) | 1,569 | 1,563 | 24 | 3 | **98.5%** | **0.19%** | **95.3%** |
+| same-tile / per-relation / BH (seed 17) | 1,473 | 1,351 | 236 | 0 | 85.1% | 0.00% | 0.9% |
+| same-tile / per-relation / BH (seed 33) | 1,434 | 1,318 | 271 | 0 | 82.9% | 0.00% | 0.0% |
+| same-tile / per-relation / BH (seed 71) | 1,412 | 1,303 | 284 | 0 | 82.1% | 0.00% | 0.7% |
+
+The measured FDR (0.19–0.91%) sits just under the 1% target. Cross-tile
+duplicates are unreachable without a nearby-tile search.
+
+**Pure-null control.** On a dataset with library duplicates but no proximity
+duplication at all, the tool estimates `pi0 = 1.000` and removes **0** reads.
+
+### 2. Real run with heavy optical duplication (patterned flowcell)
+
+90,927 read pairs, 18 tiles, 151 bp, coordinates on a 10-pixel lattice.
+
+The geometry identifies the mechanism without a simulator. Library duplicates
+land anywhere in the lane, so their tile relation should follow chance:
+
+| tile grid step | observed pairs | expected if positions independent | ratio |
+|---:|---:|---:|---:|
+| 0 (same tile) | 3,590 | 312 | **11.5×** |
+| 1 (adjacent) | 1,974 | 532 | **3.7×** |
+| ≥ 2 (distant) | **2** | 3,763 | **0.0005×** |
+
+Around 3,763 duplicate pairs should have landed on non-adjacent tiles. **Two
+did.** Essentially every duplicate in this run is a proximity duplicate. The
+same table independently confirms the tile decode — the nine most enriched tile
+pairs are exactly `X01`–`X02` for every swath.
+
+Scored against a sequence-only ground truth (reads differing at ≤ 4 of 302
+bases, an allowance calibrated from pairs one well apart, of which 96.7% differ
+at ≤ 4 — and using no coordinate, so it is independent of the spatial test):
+
+| | |
+|:---|---:|
+| true duplicate load | 6,255 reads (6.88%) |
+| removed | 6,537 |
+| true positives | 6,237 |
+| false negatives | 18 |
+| false positives | 283 |
+| **sensitivity** | **99.71%** |
+| **specificity** | **99.66%** |
+| duplicate rate before → after | 6.21% → **0.175%** |
+
+The 283 false positives are an upper bound: the truth caps at 4 mismatches, and
+3.3% of certain-optical pairs exceed that.
+
+A 259-read adapter-dimer/poly-G family, contributing 83% of all candidate
+relations, received **zero** calls — the multiplicity term and the
+density-adaptive neighbour count reject it.
+
+### 3. Clean run with almost no optical duplication (non-patterned MiSeq)
+
+124,257 read pairs, 2 tiles, continuous coordinates, 16 exact-duplicate groups
+(0.016%). This is the case where over-removal would destroy library complexity.
+
+Duplicate distances are cleanly bimodal — 34 reads have a look-alike within
+100 px, then **nothing** until 500 px.
+
+| | |
+|:---|---:|
+| reads removed | **17 (0.014%)** |
+| distance range of removals | 12–35 px |
+| distant / cross-tile duplicate groups (real library duplicates) | 15 of 16 |
+| **of those, removed** | **0** |
+
+A Picard-style 100 px rule flags exactly the same 34 reads. The *patterned*
+2500 px setting would flag **172** — a five-fold over-call. Estimating the
+scale from the data is what removes that choice.
+
+### 4. Simulated library duplicates spiked into real runs
+
+`test/spike_pcr_duplicates.py` overwrites a share of a real run with copies of
+other read pairs, keeping each recipient's own cluster position and re-drawing
+errors from its own quality string. Geometry, qualities and sequences stay
+real; the library-duplicate rate becomes known and no optical duplicates are
+added, so **every spiked read the filter removes is a false positive**.
+
+| run | spiked library duplicates | removed | **wrongly removed** |
+|:---|---:|---:|---:|
+| MiSeq + 1% | 1,242 | 17 | **0** |
+| MiSeq + 5% | 6,212 | 0 | **0** |
+| MiSeq + 10% | 12,425 | 11 | **0** |
+| MiSeq + 20% | 24,851 | 0 | **0** |
+| patterned lattice + 5% | 4,219 | 0 | **0** |
+| MiSeq + 5%, forcing `local-fdr` | 6,212 | 0 | **0** |
+| MiSeq + 5%, `--no-spatial-test` | 6,212 | 7,927 | **3,207 (51.6%)** |
+
+Zero false positives up to a 20% library-duplicate rate. The last row is the
+control: without the spatial test, half the spiked duplicates are removed.
+
+Forcing `local-fdr` — the method that removed 7% of the patterned run — still
+removes **zero** here. It is self-limiting: with `pi0 = 1` the mixture finds no
+alternative and every local FDR is one. The aggressive behaviour on the
+patterned run came from that run's data, not from the method.
+
+### 5. Retrieval under poor base quality
+
+Retrieval is exact, so a duplicate is only found when some seed window is
+error-free in **both** copies — which the base qualities decide. Fixing the
+seed length in advance discards real duplicates before the quality model can
+see them. Measured on 90 bp simulated reads at uniform quality:
+
+| flat Phred | per-base error | fixed 20 bp seed | adaptive | seed chosen |
+|---:|---:|---:|---:|---:|
+| 20 | 1.0% | 99.3% | 99.3% | 20 |
+| 16 | 2.5% | 95.0% | 98.8% | 15 |
+| 13 | 5.0% | **61.6%** | **99.4%** | 8 |
+| 11 | 7.9% | **25.8%** | **98.3%** | 8 |
+
+Shorter seeds cost candidates, not accuracy: at Phred 13 retrieval grows from
+30k to 335k relations while the tested set stays at ~16.8k, because the quality
+model discards the extra collisions.
+
+### 6. Performance
+
+| | |
+|:---|---:|
+| 40,000 read pairs, 4 threads | ~6 s |
+| 400,000 read pairs, 8 threads | **107 s**, 1.7 GB peak RSS |
+
+Measured on an Apple M-series laptop, including 20 permutation replicates, both
+plots and all audit files.
+
+---
+
+## How the model works
+
+**1 — Candidate retrieval.** Within each lane, reads are indexed by an exact
+paired hash and by exact seeds at several offsets in both mates. The seed
+length is chosen from the base qualities, as above. This stage is an index, not
+a calling rule: recall matters, precision does not, because a spurious
+candidate is discarded next.
+
+**2 — Sequence filter.** For each candidate, Phred scores become per-cycle
+error probabilities and a Bayes factor compares "one shared template" with "two
+independent templates", marginalising over the true base with the empirical
+per-cycle base composition as prior. An exact Poisson-binomial tail gives the
+probability of seeing at least this many mismatches under a shared template.
+This stage uses **only sequence and quality, never position**, which is what
+makes the spatial test that follows a genuine test.
+
+**3 — Geometry.** The tile identifier is decoded into a physical grid and every
+read is placed in one lane-wide frame per surface, so a pair split across a
+tile boundary has a real separation. Surfaces are never neighbours.
+
+**4 — The spatial test.** Each read is tested once. Given its own position, and
+given that it has *m* sequence-compatible look-alikes anywhere in the lane and
+surface, how surprising is it that the closest of them landed as close as it
+did? With *M* other clusters in the lane and *K* of them within the observed
+distance,
+
+```
+p = 1 − C(M−K, m) / C(M, m)          (for m = 1, simply K / M)
+```
+
+Counting neighbours **around the read itself** is what makes the test adapt to
+local density: the same separation is unremarkable in a crowded patch and
+surprising in a sparse one. Testing reads rather than relations stops a family
+of *k* identical reads from raising *k(k−1)/2* hypotheses over *k* reads.
+
+**5 — Decision.** FDR control by the method above, then significant reads and
+their nearest partners are joined into components and the highest total
+R1+R2 quality member of each is retained.
+
+**6 — Self-check.** Two negative controls are recomputed every run: a
+permutation of the position labels, which tests whether the geometry null is
+computed correctly, and quality-model-rejected read pairs, which tests whether
+within-lane exchangeability holds on real reads.
+
+---
+
+## Scope and limitations
+
+- FastqOptiFilter cannot distinguish optical duplication from **any other
+  mechanism that puts sequence-identical reads close together**, such as a
+  low-complexity or poly-G cluster. The `sequence_incompatible` control tells
+  you how much of that a run contains.
+- Without UMIs it cannot perfectly separate a library copy from an
+  independently generated molecule with the same insert, which matters most for
+  non-randomly fragmented cfDNA.
+- Read removal is component-based, so the nominal FDR is not an exact
+  read-level error rate; the report carries an estimate that sums the local FDR
+  of the relation supporting each removal.
+- Candidate retrieval needs at least one exact seed or exact full paired
+  sequence match.
+- Base qualities are assumed approximately calibrated and conditionally
+  independent by cycle.
+- Cross-tile adjacency is decoded from the tile identifier; an unrecognised
+  convention falls back to a single nominal column.
+- Fixed-length reads only.
+- For final library-complexity estimates, remap the filtered FASTQs and rerun
+  the same duplicate-marking pipeline used on the unfiltered data, retaining
+  the FDR sensitivity table as uncertainty around the correction.
+
+---
+
+## Tests
+
+```bash
+# full calibration and accuracy suite (~5 min)
+python3 test/test_calibration.py
+
+# generate simulated data with ground truth
+python3 test/simulate_fastq.py --out-prefix sim --reads 40000 --seed 17
+
+# score a run against that truth
+python3 test/evaluate_run.py --truth sim.truth.tsv.gz --filtered-r1 out_R1.fastq.gz
+
+# spike library duplicates into a real run at a known rate
+python3 test/spike_pcr_duplicates.py --r1 real_R1.fastq.gz --r2 real_R2.fastq.gz \
+    --out-prefix spiked --pcr-rate 0.05
+```
+
+---
+
+## Contact
+
+Questions, bug reports and feature requests are welcome.
+
+**Yaping Liu** — <lyping1986@gmail.com>
+
+Please open an issue on
+[GitHub](https://github.com/epifluidlab/FastqOptiFilter/issues) for anything
+reproducible, and include the JSON report where possible — it contains the
+geometry decode and the null-calibration table, which is usually enough to
+diagnose a problem.
+
+---
+
+## License
+
+Released under the **MIT License**. See [LICENSE](LICENSE) for the full text.
+
+```
+MIT License
+
+Copyright (c) 2026 epifluidlab
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
