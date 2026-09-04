@@ -66,7 +66,7 @@ from scipy.special import expit
 from scipy.stats import chi2, poisson_binom
 
 
-VERSION = "2.0.0"
+VERSION = "0.1.1"
 BASES = b"ACGT"
 BASE_LOOKUP = np.full(256, 4, dtype=np.uint8)
 for _base_index, _base in enumerate(BASES):

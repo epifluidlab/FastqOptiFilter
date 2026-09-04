@@ -24,7 +24,7 @@ repository-code: "https://github.com/epifluidlab/FastqOptiFilter"
 url: "https://github.com/epifluidlab/FastqOptiFilter"
 doi: "10.5281/zenodo.22307671"
 license: MIT
-version: "2.0.0"
+version: "0.1.1"
 date-released: "2026-09-04"
 keywords:
   - bioinformatics

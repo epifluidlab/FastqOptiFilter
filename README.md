@@ -774,7 +774,7 @@ cite it:
   year    = {2026},
   doi     = {10.5281/zenodo.22307671},
   url     = {https://github.com/epifluidlab/FastqOptiFilter},
-  version = {2.0.0},
+  version = {0.1.1},
   license = {MIT}
 }
 ```

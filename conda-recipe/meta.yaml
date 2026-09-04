@@ -1,7 +1,7 @@
 {# conda-build cannot read a file outside the recipe directory, so the version #}
 {# is pinned here. The test section asserts it against fastq_optifilter.VERSION, #}
 {# so a mismatch fails the build instead of shipping a mislabelled package. #}
-{% set version = "2.0.0" %}
+{% set version = "0.1.1" %}
 
 package:
   name: fastqoptifilter
